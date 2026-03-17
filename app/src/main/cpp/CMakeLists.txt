@@ -3,6 +3,8 @@
 cmake_minimum_required(VERSION 3.10.2)
 project("anc-lib")
 
+find_package(oboe REQUIRED CONFIG)
+
 add_library(anc-lib SHARED LmsEngine.cpp)
 
 find_library(log-lib log)

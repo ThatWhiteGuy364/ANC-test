@@ -60,7 +60,7 @@ class MainActivity : AppCompatActivity() {
         val intent = Intent(this, AncService::class.java)
         startForegroundService(intent)
         isRunning = true
-        binding.btnToggleAnc.text = "Ignite ANC"
+        binding.btnToggleAnc.text = "Stop ANC"
         handler.post(updateVisualizer)
     }
 

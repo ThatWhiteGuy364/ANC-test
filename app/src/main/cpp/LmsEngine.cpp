@@ -133,7 +133,7 @@ Java_com_whitelabs_anc_AncService_stopEngine(JNIEnv* env, jobject thiz) {
 }
 
 extern "C" JNIEXPORT jfloatArray JNICALL
-Java_com_whitelabs_anc_AncService_getFftData(JNIEnv* env, jobject thiz) {
+Java_com_whitelabs_anc_MainActivity_getFftData(JNIEnv* env, jobject thiz) {
     jfloatArray result = env->NewFloatArray(latestMagnitudes.size());
     env->SetFloatArrayRegion(result, 0, latestMagnitudes.size(), latestMagnitudes.data());
     return result;
