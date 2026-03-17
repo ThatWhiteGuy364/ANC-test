@@ -42,7 +42,7 @@ static void computeFFT(std::vector<std::complex<float>>& data) {
     computeFFT(odd);
 
     for (int k = 0; k < n / 2; ++k) {
-        std::complex<float> t = std::polar(1.0f, -2.0f * M_PI * k / n) * odd[k];
+        std::complex<float> t = std::polar<float>(1.0f, -2.0f * float(M_PI) * k / n) * odd[k];
         data[k]         = even[k] + t;
         data[k + n / 2] = even[k] - t;
     }
@@ -115,12 +115,12 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_whitelabs_anc_AncService_startEngine(JNIEnv* env, jobject thiz) {
     oboe::AudioStreamBuilder builder;
     builder.setDirection(oboe::Direction::Input)
-           .setPerformanceMode(oboe::PerformanceMode::LowLatency)
-           .setSharingMode(oboe::SharingMode::Exclusive)
-           .setFormat(oboe::AudioFormat::Float)
-           .setChannelCount(oboe::ChannelCount::Stereo)
-           .setDataCallback(&engine)
-           .openStream(stream);
+           ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
+           ->setSharingMode(oboe::SharingMode::Exclusive)
+           ->setFormat(oboe::AudioFormat::Float)
+           ->setChannelCount(oboe::ChannelCount::Stereo)
+           ->setDataCallback(&engine)
+           ->openStream(stream);
     stream->requestStart();
 }
 

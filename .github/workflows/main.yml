@@ -26,6 +26,9 @@ jobs:
       - name: Accept Android SDK licenses
         run: yes | sdkmanager --licenses
 
+      - name: Update SDK tools
+        run: sdkmanager --update
+
       - name: Install NDK and CMake
         run: |
           sdkmanager "ndk;26.1.10909125"
