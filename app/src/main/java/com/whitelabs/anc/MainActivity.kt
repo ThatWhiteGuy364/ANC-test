@@ -5,10 +5,10 @@ package com.whitelabs.anc
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.media.AudioManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import com.whitelabs.anc.databinding.ActivityMainBinding
@@ -21,8 +21,13 @@ class MainActivity : AppCompatActivity() {
     private var isRunning = false
 
     private external fun getFftData(): FloatArray
-    private external fun enableLogging(path: String)
+    private external fun enableLogging(fd: Int)
     private external fun disableLogging()
+
+    private val requestMicPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (granted) startAnc()
+        }
 
     private val updateVisualizer = object : Runnable {
         override fun run() {
@@ -38,13 +43,13 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        val audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
-        audioManager.isBluetoothScoOn = true
-
         binding.switchLogging.setOnCheckedChangeListener { _, isChecked ->
             if (isChecked) {
                 val logFile = File(getExternalFilesDir(null), "anc_dev.log")
-                enableLogging(logFile.absolutePath)
+                val fd = logFile.outputStream().fd.let {
+                    android.system.Os.dup(it)
+                }
+                enableLogging(fd.fd)
             } else {
                 disableLogging()
             }
@@ -55,7 +60,7 @@ class MainActivity : AppCompatActivity() {
                 if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
                     != PackageManager.PERMISSION_GRANTED
                 ) {
-                    requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 101)
+                    requestMicPermission.launch(Manifest.permission.RECORD_AUDIO)
                 } else {
                     startAnc()
                 }
@@ -76,19 +81,6 @@ class MainActivity : AppCompatActivity() {
         startService(Intent(this, AncService::class.java).apply { action = "STOP" })
         isRunning = false
         binding.btnToggleAnc.text = "Ignite ANC"
-    }
-
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 101 && grantResults.isNotEmpty() &&
-            grantResults[0] == PackageManager.PERMISSION_GRANTED
-        ) {
-            startAnc()
-        }
     }
 
     companion object {

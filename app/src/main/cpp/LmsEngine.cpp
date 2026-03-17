@@ -189,14 +189,20 @@ Java_com_whitelabs_anc_MainActivity_getFftData(JNIEnv* env, jobject thiz) {
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_whitelabs_anc_MainActivity_enableLogging(JNIEnv* env, jobject thiz, jstring jpath) {
-    const char* path = env->GetStringUTFChars(jpath, nullptr);
+Java_com_whitelabs_anc_MainActivity_enableLogging(JNIEnv* env, jobject thiz, jint fd) {
     {
         std::lock_guard<std::mutex> lock(logMutex);
         if (logStream.is_open()) logStream.close();
-        logStream.open(path, std::ios::app);
+        FILE* f = fdopen(fd, "a");
+        if (f == nullptr) {
+            LOGE("fdopen failed for logging fd");
+            return;
+        }
+        logStream.open(std::to_string(fd));
+        fclose(f);
+        logStream.close();
+        logStream.__open(fd, std::ios::app | std::ios::out);
     }
-    env->ReleaseStringUTFChars(jpath, path);
     loggingEnabled.store(true);
     logFrameCounter = 0;
     writeLog("=== Logging session started ===");
