@@ -12,6 +12,7 @@ import android.os.Looper
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import com.whitelabs.anc.databinding.ActivityMainBinding
+import java.io.File
 
 class MainActivity : AppCompatActivity() {
 
@@ -19,14 +20,14 @@ class MainActivity : AppCompatActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private var isRunning = false
 
-    // JNI: poll FFT data from C++ engine
     private external fun getFftData(): FloatArray
+    private external fun enableLogging(path: String)
+    private external fun disableLogging()
 
     private val updateVisualizer = object : Runnable {
         override fun run() {
             if (isRunning) {
-                val data = getFftData()
-                binding.visualizerView.updateData(data)
+                binding.visualizerView.updateData(getFftData())
                 handler.postDelayed(this, 16)
             }
         }
@@ -37,9 +38,17 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        // Prefer Bluetooth / wired headset microphone
         val audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
         audioManager.isBluetoothScoOn = true
+
+        binding.switchLogging.setOnCheckedChangeListener { _, isChecked ->
+            if (isChecked) {
+                val logFile = File(getExternalFilesDir(null), "anc_dev.log")
+                enableLogging(logFile.absolutePath)
+            } else {
+                disableLogging()
+            }
+        }
 
         binding.btnToggleAnc.setOnClickListener {
             if (!isRunning) {
@@ -57,16 +66,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startAnc() {
-        val intent = Intent(this, AncService::class.java)
-        startForegroundService(intent)
+        startForegroundService(Intent(this, AncService::class.java))
         isRunning = true
         binding.btnToggleAnc.text = "Stop ANC"
         handler.post(updateVisualizer)
     }
 
     private fun stopAnc() {
-        val intent = Intent(this, AncService::class.java).apply { action = "STOP" }
-        startService(intent)
+        startService(Intent(this, AncService::class.java).apply { action = "STOP" })
         isRunning = false
         binding.btnToggleAnc.text = "Ignite ANC"
     }
