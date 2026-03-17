@@ -46,10 +46,14 @@ class MainActivity : AppCompatActivity() {
         binding.switchLogging.setOnCheckedChangeListener { _, isChecked ->
             if (isChecked) {
                 val logFile = File(getExternalFilesDir(null), "anc_dev.log")
-                val fd = logFile.outputStream().fd.let {
-                    android.system.Os.dup(it)
-                }
-                enableLogging(fd.fd)
+                val pfd = android.os.ParcelFileDescriptor.open(
+                    logFile,
+                    android.os.ParcelFileDescriptor.MODE_CREATE or
+                    android.os.ParcelFileDescriptor.MODE_WRITE_ONLY or
+                    android.os.ParcelFileDescriptor.MODE_APPEND
+                )
+                enableLogging(pfd.fd)
+                pfd.detachFd()
             } else {
                 disableLogging()
             }
