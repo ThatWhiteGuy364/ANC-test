@@ -5,31 +5,58 @@
 #include <vector>
 #include <complex>
 #include <cmath>
+#include <atomic>
+#include <mutex>
+#include <fstream>
+#include <string>
+#include <ctime>
+#include <android/log.h>
+
+#define LOG_TAG "WhiteLabsANC"
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-static constexpr int kFilterSize = 128;
-static constexpr float kMu = 0.01f;
-static constexpr float kMuHigh = 0.001f;
-static constexpr int kFftSize = 256;
+static constexpr int kFilterSize  = 128;
+static constexpr float kMu        = 0.01f;
+static constexpr int kFftSize     = 256;
+static constexpr int kLogInterval = 4800;
 
 // ─── Global State ─────────────────────────────────────────────────────────────
 
-// Per-channel weights and ring buffers (Stereo: Left=0, Right=1)
-static float weightsL[kFilterSize] = {0.0f};
-static float weightsR[kFilterSize] = {0.0f};
-static float bufferL[kFilterSize]  = {0.0f};
-static float bufferR[kFilterSize]  = {0.0f};
+static float weights[kFilterSize] = {0.0f};
+static float ringBuf[kFilterSize] = {0.0f};
 
-// Latest FFT magnitude spectrum for the VisualizerView
-static std::vector<float> latestMagnitudes(kFftSize, 0.0f);
+static std::vector<float> latestMagnitudes(kFftSize / 2, 0.0f);
+static std::mutex fftMutex;
 
-static float mu = kMu;
+static std::ofstream logStream;
+static std::mutex logMutex;
+static std::atomic<bool> loggingEnabled{false};
+static int logFrameCounter = 0;
+
+// ─── Logging Helpers ──────────────────────────────────────────────────────────
+
+static std::string timestamp() {
+    std::time_t t = std::time(nullptr);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
+    return std::string(buf);
+}
+
+static void writeLog(const std::string& line) {
+    if (!loggingEnabled.load()) return;
+    std::lock_guard<std::mutex> lock(logMutex);
+    if (logStream.is_open()) {
+        logStream << "[" << timestamp() << "] " << line << "\n";
+        logStream.flush();
+    }
+}
 
 // ─── FFT (Radix-2 Cooley-Tukey) ──────────────────────────────────────────────
 
 static void computeFFT(std::vector<std::complex<float>>& data) {
-    int n = data.size();
+    int n = static_cast<int>(data.size());
     if (n <= 1) return;
 
     std::vector<std::complex<float>> even(n / 2), odd(n / 2);
@@ -42,62 +69,67 @@ static void computeFFT(std::vector<std::complex<float>>& data) {
     computeFFT(odd);
 
     for (int k = 0; k < n / 2; ++k) {
-        std::complex<float> t = std::polar<float>(1.0f, -2.0f * float(M_PI) * k / n) * odd[k];
+        std::complex<float> t = std::polar<float>(1.0f, -2.0f * float(M_PI) * float(k) / float(n)) * odd[k];
         data[k]         = even[k] + t;
         data[k + n / 2] = even[k] - t;
     }
 }
 
-// ─── Stereo ANC Engine ───────────────────────────────────────────────────────
+// ─── Mono ANC Engine ─────────────────────────────────────────────────────────
 
-class StereoAncEngine : public oboe::AudioStreamDataCallback {
+class AncEngine : public oboe::AudioStreamDataCallback {
 public:
-    oboe::DataCallbackResult onAudioReady(oboe::AudioStream* stream,
+    oboe::DataCallbackResult onAudioReady(oboe::AudioStream* audioStream,
                                           void* audioData,
                                           int32_t numFrames) override {
         auto* floatData = static_cast<float*>(audioData);
-        int channelCount = stream->getChannelCount();
+
+        float sumError = 0.0f;
+        float sumPower = 0.0f;
 
         for (int i = 0; i < numFrames; ++i) {
-            for (int ch = 0; ch < channelCount; ++ch) {
-                int idx = i * channelCount + ch;
-                float noise = floatData[idx];
+            float noise = floatData[i];
 
-                float* weights = (ch == 0) ? weightsL : weightsR;
-                float* buffer  = (ch == 0) ? bufferL  : bufferR;
+            for (int j = kFilterSize - 1; j > 0; --j) ringBuf[j] = ringBuf[j - 1];
+            ringBuf[0] = noise;
 
-                // Shift buffer
-                for (int j = kFilterSize - 1; j > 0; --j) buffer[j] = buffer[j - 1];
-                buffer[0] = noise;
+            float antiNoise = 0.0f;
+            for (int j = 0; j < kFilterSize; ++j) antiNoise += weights[j] * ringBuf[j];
 
-                // Estimate anti-noise
-                float antiNoise = 0.0f;
-                for (int j = 0; j < kFilterSize; ++j) antiNoise += weights[j] * buffer[j];
+            float error = noise - antiNoise;
+            sumError += error * error;
+            sumPower += noise * noise;
 
-                // Error: residual noise after cancellation
-                float error = noise - antiNoise;
+            for (int j = 0; j < kFilterSize; ++j)
+                weights[j] += kMu * error * ringBuf[j];
 
-                // Dynamic mu: slow down for high-frequency content
-                float currentMu = (ch == 0 && i % 2 == 0) ? kMuHigh : kMu;
-
-                // Update LMS weights
-                for (int j = 0; j < kFilterSize; ++j)
-                    weights[j] += currentMu * error * buffer[j];
-
-                // Inject inverted anti-noise signal
-                floatData[idx] = -antiNoise;
-            }
+            floatData[i] = -antiNoise;
         }
 
-        // ── FFT for VisualizerView (mono mix) ──
         std::vector<std::complex<float>> fftData(kFftSize, {0.0f, 0.0f});
-        for (int i = 0; i < kFftSize && i < numFrames; ++i) {
-            float sample = floatData[i * channelCount];
-            fftData[i] = {sample, 0.0f};
-        }
+        for (int i = 0; i < kFftSize && i < numFrames; ++i)
+            fftData[i] = {floatData[i], 0.0f};
+
         computeFFT(fftData);
-        for (int i = 0; i < kFftSize / 2; ++i) {
-            latestMagnitudes[i] = std::abs(fftData[i]);
+
+        {
+            std::lock_guard<std::mutex> lock(fftMutex);
+            for (int i = 0; i < kFftSize / 2; ++i)
+                latestMagnitudes[i] = std::abs(fftData[i]);
+        }
+
+        if (loggingEnabled.load()) {
+            logFrameCounter += numFrames;
+            if (logFrameCounter >= kLogInterval) {
+                logFrameCounter = 0;
+                float rmsError = std::sqrt(sumError / float(numFrames));
+                float rmsPower = std::sqrt(sumPower / float(numFrames));
+                char buf[128];
+                std::snprintf(buf, sizeof(buf),
+                    "frames=%d  input_rms=%.5f  error_rms=%.5f",
+                    numFrames, rmsPower, rmsError);
+                writeLog(buf);
+            }
         }
 
         return oboe::DataCallbackResult::Continue;
@@ -106,7 +138,7 @@ public:
 
 // ─── Singleton Engine & Stream ────────────────────────────────────────────────
 
-static StereoAncEngine engine;
+static AncEngine engine;
 static std::shared_ptr<oboe::AudioStream> stream;
 
 // ─── JNI Exports ─────────────────────────────────────────────────────────────
@@ -114,14 +146,28 @@ static std::shared_ptr<oboe::AudioStream> stream;
 extern "C" JNIEXPORT void JNICALL
 Java_com_whitelabs_anc_AncService_startEngine(JNIEnv* env, jobject thiz) {
     oboe::AudioStreamBuilder builder;
-    builder.setDirection(oboe::Direction::Input)
-           ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
-           ->setSharingMode(oboe::SharingMode::Exclusive)
-           ->setFormat(oboe::AudioFormat::Float)
-           ->setChannelCount(oboe::ChannelCount::Stereo)
-           ->setDataCallback(&engine)
-           ->openStream(stream);
-    stream->requestStart();
+    oboe::Result result = builder
+        .setDirection(oboe::Direction::Input)
+        ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
+        ->setSharingMode(oboe::SharingMode::Shared)
+        ->setFormat(oboe::AudioFormat::Float)
+        ->setChannelCount(oboe::ChannelCount::Mono)
+        ->setDataCallback(&engine)
+        ->openStream(stream);
+
+    if (result != oboe::Result::OK) {
+        LOGE("openStream failed: %s", oboe::convertToText(result));
+        writeLog(std::string("openStream failed: ") + oboe::convertToText(result));
+        return;
+    }
+
+    result = stream->requestStart();
+    if (result != oboe::Result::OK) {
+        LOGE("requestStart failed: %s", oboe::convertToText(result));
+        writeLog(std::string("requestStart failed: ") + oboe::convertToText(result));
+    } else {
+        writeLog("Engine started OK");
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -129,12 +175,37 @@ Java_com_whitelabs_anc_AncService_stopEngine(JNIEnv* env, jobject thiz) {
     if (stream) {
         stream->requestStop();
         stream->close();
+        stream.reset();
+        writeLog("Engine stopped");
     }
 }
 
 extern "C" JNIEXPORT jfloatArray JNICALL
 Java_com_whitelabs_anc_MainActivity_getFftData(JNIEnv* env, jobject thiz) {
-    jfloatArray result = env->NewFloatArray(latestMagnitudes.size());
-    env->SetFloatArrayRegion(result, 0, latestMagnitudes.size(), latestMagnitudes.data());
+    std::lock_guard<std::mutex> lock(fftMutex);
+    jfloatArray result = env->NewFloatArray(static_cast<jsize>(latestMagnitudes.size()));
+    env->SetFloatArrayRegion(result, 0, static_cast<jsize>(latestMagnitudes.size()), latestMagnitudes.data());
     return result;
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_whitelabs_anc_MainActivity_enableLogging(JNIEnv* env, jobject thiz, jstring jpath) {
+    const char* path = env->GetStringUTFChars(jpath, nullptr);
+    {
+        std::lock_guard<std::mutex> lock(logMutex);
+        if (logStream.is_open()) logStream.close();
+        logStream.open(path, std::ios::app);
+    }
+    env->ReleaseStringUTFChars(jpath, path);
+    loggingEnabled.store(true);
+    logFrameCounter = 0;
+    writeLog("=== Logging session started ===");
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_whitelabs_anc_MainActivity_disableLogging(JNIEnv* env, jobject thiz) {
+    writeLog("=== Logging session ended ===");
+    loggingEnabled.store(false);
+    std::lock_guard<std::mutex> lock(logMutex);
+    if (logStream.is_open()) logStream.close();
 }
