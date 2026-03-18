@@ -7,9 +7,9 @@
 #include <cmath>
 #include <atomic>
 #include <mutex>
-#include <string>
 #include <ctime>
 #include <cstdio>
+#include <cstring>
 #include <unistd.h>
 #include <android/log.h>
 
@@ -19,52 +19,21 @@
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-static constexpr int   kFilterSize  = 128;
-static constexpr float kMu          = 0.005f;
-static constexpr int   kFftSize     = 256;
-static constexpr int   kLogInterval = 4800;
-static constexpr int   kRingBufSize = 2048;
-
-// ─── Lock-free Ring Buffer ────────────────────────────────────────────────────
-
-struct RingBuffer {
-    float data[kRingBufSize] = {};
-    std::atomic<int> head{0};
-    std::atomic<int> tail{0};
-
-    void push(float v) {
-        int h = head.load(std::memory_order_relaxed);
-        data[h] = v;
-        head.store((h + 1) % kRingBufSize, std::memory_order_release);
-    }
-
-    float pop() {
-        int t = tail.load(std::memory_order_relaxed);
-        int h = head.load(std::memory_order_acquire);
-        if (t == h) return 0.0f;
-        float v = data[t];
-        tail.store((t + 1) % kRingBufSize, std::memory_order_release);
-        return v;
-    }
-
-    int available() {
-        int h = head.load(std::memory_order_acquire);
-        int t = tail.load(std::memory_order_relaxed);
-        return (h - t + kRingBufSize) % kRingBufSize;
-    }
-};
-
-static RingBuffer antiNoiseBuf;
+static constexpr int   kFilterSize   = 64;
+static constexpr float kMu           = 0.005f;
+static constexpr int   kFftSize      = 256;
+static constexpr int   kLogInterval  = 4800;
+static constexpr int   kFramesPerCb  = 96;
 
 // ─── LMS State ────────────────────────────────────────────────────────────────
 
-static float weights[kFilterSize] = {};
+static float weights[kFilterSize]    = {};
 static float lmsRingBuf[kFilterSize] = {};
 
 // ─── FFT State ────────────────────────────────────────────────────────────────
 
 static std::vector<float> latestMagnitudes(kFftSize / 2, 0.0f);
-static std::mutex fftMutex;
+static std::mutex          fftMutex;
 
 // ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -104,19 +73,38 @@ static void computeFFT(std::vector<std::complex<float>>& data) {
     }
 }
 
-// ─── Input Callback: Mic → LMS → Ring Buffer ─────────────────────────────────
+// ─── Duplex Callback ─────────────────────────────────────────────────────────
+//
+// Runs on the OUTPUT stream thread. Synchronously reads from the input stream
+// with timeout=0, processes LMS in-place, writes anti-noise to the output
+// buffer — all in one callback with no ring buffer latency.
 
-class InputCallback : public oboe::AudioStreamDataCallback {
+class DuplexCallback : public oboe::AudioStreamDataCallback {
 public:
-    oboe::DataCallbackResult onAudioReady(oboe::AudioStream* stream,
+    oboe::AudioStream* inputStream = nullptr;
+
+    oboe::DataCallbackResult onAudioReady(oboe::AudioStream* /*outputStream*/,
                                           void* audioData,
                                           int32_t numFrames) override {
-        auto* in = static_cast<float*>(audioData);
+        auto* out = static_cast<float*>(audioData);
+
+        float inBuf[kFramesPerCb];
+        std::memset(inBuf, 0, sizeof(float) * numFrames);
+
+        if (inputStream) {
+            auto res = inputStream->read(inBuf, numFrames, 0 /*timeoutNanos=0*/);
+            if (!res) {
+                std::memset(out, 0, sizeof(float) * numFrames);
+                return oboe::DataCallbackResult::Continue;
+            }
+        }
+
         float sumError = 0.0f;
         float sumPower = 0.0f;
 
         for (int i = 0; i < numFrames; ++i) {
-            float noise = in[i];
+            float noise = inBuf[i];
+
             for (int j = kFilterSize - 1; j > 0; --j) lmsRingBuf[j] = lmsRingBuf[j - 1];
             lmsRingBuf[0] = noise;
 
@@ -130,12 +118,13 @@ public:
             for (int j = 0; j < kFilterSize; ++j)
                 weights[j] += kMu * error * lmsRingBuf[j];
 
-            antiNoiseBuf.push(-antiNoise);
+            out[i] = -antiNoise;
         }
 
+        // FFT on output for visualiser
         std::vector<std::complex<float>> fftData(kFftSize, {0.0f, 0.0f});
         for (int i = 0; i < kFftSize && i < numFrames; ++i)
-            fftData[i] = {in[i], 0.0f};
+            fftData[i] = {inBuf[i], 0.0f};
         computeFFT(fftData);
         {
             std::lock_guard<std::mutex> lock(fftMutex);
@@ -149,11 +138,10 @@ public:
                 logFrameCounter = 0;
                 char buf[128];
                 std::snprintf(buf, sizeof(buf),
-                    "frames=%d  input_rms=%.5f  error_rms=%.5f  ring_avail=%d",
+                    "frames=%d  input_rms=%.5f  error_rms=%.5f",
                     numFrames,
                     std::sqrt(sumPower / float(numFrames)),
-                    std::sqrt(sumError / float(numFrames)),
-                    antiNoiseBuf.available());
+                    std::sqrt(sumError / float(numFrames)));
                 writeLog(buf);
             }
         }
@@ -162,24 +150,9 @@ public:
     }
 };
 
-// ─── Output Callback: Ring Buffer → Speaker ───────────────────────────────────
-
-class OutputCallback : public oboe::AudioStreamDataCallback {
-public:
-    oboe::DataCallbackResult onAudioReady(oboe::AudioStream* stream,
-                                          void* audioData,
-                                          int32_t numFrames) override {
-        auto* out = static_cast<float*>(audioData);
-        for (int i = 0; i < numFrames; ++i)
-            out[i] = antiNoiseBuf.pop();
-        return oboe::DataCallbackResult::Continue;
-    }
-};
-
 // ─── Singletons ───────────────────────────────────────────────────────────────
 
-static InputCallback  inputCb;
-static OutputCallback outputCb;
+static DuplexCallback duplexCb;
 static std::shared_ptr<oboe::AudioStream> inputStream;
 static std::shared_ptr<oboe::AudioStream> outputStream;
 
@@ -189,13 +162,15 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_whitelabs_anc_AncService_startEngine(JNIEnv*, jobject) {
     oboe::Result r;
 
+    // Output stream first — drives the callback thread
     r = oboe::AudioStreamBuilder()
         .setDirection(oboe::Direction::Output)
         ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
         ->setSharingMode(oboe::SharingMode::Exclusive)
         ->setFormat(oboe::AudioFormat::Float)
         ->setChannelCount(oboe::ChannelCount::Mono)
-        ->setDataCallback(&outputCb)
+        ->setFramesPerDataCallback(kFramesPerCb)
+        ->setDataCallback(&duplexCb)
         ->openStream(outputStream);
 
     if (r != oboe::Result::OK) {
@@ -204,15 +179,18 @@ Java_com_whitelabs_anc_AncService_startEngine(JNIEnv*, jobject) {
         return;
     }
 
+    int sampleRate = outputStream->getSampleRate();
+    LOGI("Output SR=%d  framesPerCb=%d", sampleRate, kFramesPerCb);
+
+    // Input stream — matched sample rate, no callback (read() driven by output)
     r = oboe::AudioStreamBuilder()
         .setDirection(oboe::Direction::Input)
         ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
         ->setSharingMode(oboe::SharingMode::Shared)
         ->setFormat(oboe::AudioFormat::Float)
         ->setChannelCount(oboe::ChannelCount::Mono)
-        ->setSampleRate(outputStream->getSampleRate())
-        ->setFramesPerDataCallback(outputStream->getFramesPerDataCallback())
-        ->setDataCallback(&inputCb)
+        ->setSampleRate(sampleRate)
+        ->setBufferCapacityInFrames(kFramesPerCb * 2)
         ->openStream(inputStream);
 
     if (r != oboe::Result::OK) {
@@ -223,16 +201,21 @@ Java_com_whitelabs_anc_AncService_startEngine(JNIEnv*, jobject) {
         return;
     }
 
-    outputStream->requestStart();
+    // Wire input stream pointer into the callback before starting
+    duplexCb.inputStream = inputStream.get();
+
     inputStream->requestStart();
-    writeLog("Engine started — dual stream OK");
-    LOGI("ANC engine started. SR=%d", outputStream->getSampleRate());
+    outputStream->requestStart();
+
+    writeLog("Engine started — duplex single-callback OK");
+    LOGI("ANC engine running");
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_whitelabs_anc_AncService_stopEngine(JNIEnv*, jobject) {
-    if (inputStream)  { inputStream->requestStop();  inputStream->close();  inputStream.reset(); }
+    duplexCb.inputStream = nullptr;
     if (outputStream) { outputStream->requestStop(); outputStream->close(); outputStream.reset(); }
+    if (inputStream)  { inputStream->requestStop();  inputStream->close();  inputStream.reset(); }
     writeLog("Engine stopped");
 }
 

@@ -5,20 +5,22 @@ package com.whitelabs.anc
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelFileDescriptor
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import com.whitelabs.anc.databinding.ActivityMainBinding
-import java.io.File
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private val handler = Handler(Looper.getMainLooper())
     private var isRunning = false
+    private var logPfd: ParcelFileDescriptor? = null
 
     private external fun getFftData(): FloatArray
     private external fun enableLogging(fd: Int)
@@ -27,6 +29,15 @@ class MainActivity : AppCompatActivity() {
     private val requestMicPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             if (granted) startAnc()
+        }
+
+    private val pickLogFile =
+        registerForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri: Uri? ->
+            if (uri == null) {
+                binding.switchLogging.isChecked = false
+                return@registerForActivityResult
+            }
+            openLogUri(uri)
         }
 
     private val updateVisualizer = object : Runnable {
@@ -45,22 +56,9 @@ class MainActivity : AppCompatActivity() {
 
         binding.switchLogging.setOnCheckedChangeListener { _, isChecked ->
             if (isChecked) {
-                try {
-                    val dir = getExternalFilesDir(null) ?: filesDir
-                    val logFile = File(dir, "anc_dev.log")
-                    val pfd = android.os.ParcelFileDescriptor.open(
-                        logFile,
-                        android.os.ParcelFileDescriptor.MODE_CREATE or
-                        android.os.ParcelFileDescriptor.MODE_WRITE_ONLY or
-                        android.os.ParcelFileDescriptor.MODE_APPEND
-                    )
-                    val rawFd = pfd.detachFd()
-                    enableLogging(rawFd)
-                } catch (e: Exception) {
-                    binding.switchLogging.isChecked = false
-                }
+                pickLogFile.launch("anc_dev.log")
             } else {
-                disableLogging()
+                stopLogging()
             }
         }
 
@@ -79,6 +77,25 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun openLogUri(uri: Uri) {
+        try {
+            val pfd = contentResolver.openFileDescriptor(uri, "wa")
+                ?: throw IllegalStateException("Could not open file descriptor")
+            logPfd?.close()
+            logPfd = pfd
+            enableLogging(pfd.fd)
+        } catch (e: Exception) {
+            binding.switchLogging.isChecked = false
+            logPfd = null
+        }
+    }
+
+    private fun stopLogging() {
+        disableLogging()
+        logPfd?.close()
+        logPfd = null
+    }
+
     private fun startAnc() {
         startForegroundService(Intent(this, AncService::class.java))
         isRunning = true
@@ -90,6 +107,11 @@ class MainActivity : AppCompatActivity() {
         startService(Intent(this, AncService::class.java).apply { action = "STOP" })
         isRunning = false
         binding.btnToggleAnc.text = "Ignite ANC"
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        stopLogging()
     }
 
     companion object {
