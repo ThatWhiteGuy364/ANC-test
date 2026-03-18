@@ -291,11 +291,12 @@ Java_com_whitelabs_anc_AncService_startEngine(JNIEnv*, jobject) {
 
     // Start input first, pre-fill ring buffer with 2 callback periods of silence
     // so output never starves on the very first callbacks
-    inputStream->requestStart();
-    for (int i = 0; i < kFramesPerCb * 2; ++i) antiNoiseBuf.push(0.0f);
-    usleep(10000); // 10ms: let input accumulate real data before output starts
-
+    // Start OUTPUT first with ring pre-filled with one period of silence.
+    // Output drains silence while input initialises — gap stays at ~1 callback (2ms).
+    // Starting input first was causing a fixed 832ms offset in the ring.
+    for (int i = 0; i < kFramesPerCb; ++i) antiNoiseBuf.push(0.0f);
     outputStream->requestStart();
+    inputStream->requestStart();
     writeLog("Both streams started — engine running");
 }
 
