@@ -24,6 +24,12 @@ static constexpr float kMu           = 0.005f;
 static constexpr int   kFftSize      = 256;
 static constexpr int   kLogInterval  = 4800;
 static constexpr int   kFramesPerCb  = 96;
+static constexpr int   kSampleRate   = 48000;
+
+// Half a buffer period in nanoseconds — long enough to wait for mic data
+// without overrunning the output callback deadline
+static constexpr int64_t kReadTimeoutNs =
+    static_cast<int64_t>(kFramesPerCb) * 1000000000LL / kSampleRate / 2;
 
 // ─── LMS State ────────────────────────────────────────────────────────────────
 
@@ -74,10 +80,6 @@ static void computeFFT(std::vector<std::complex<float>>& data) {
 }
 
 // ─── Duplex Callback ─────────────────────────────────────────────────────────
-//
-// Runs on the OUTPUT stream thread. Synchronously reads from the input stream
-// with timeout=0, processes LMS in-place, writes anti-noise to the output
-// buffer — all in one callback with no ring buffer latency.
 
 class DuplexCallback : public oboe::AudioStreamDataCallback {
 public:
@@ -87,13 +89,13 @@ public:
                                           void* audioData,
                                           int32_t numFrames) override {
         auto* out = static_cast<float*>(audioData);
-
         float inBuf[kFramesPerCb];
         std::memset(inBuf, 0, sizeof(float) * numFrames);
 
         if (inputStream) {
-            auto res = inputStream->read(inBuf, numFrames, 0 /*timeoutNanos=0*/);
-            if (!res) {
+            auto res = inputStream->read(inBuf, numFrames, kReadTimeoutNs);
+            if (!res || res.value() == 0) {
+                // No mic data yet — output silence, keep going
                 std::memset(out, 0, sizeof(float) * numFrames);
                 return oboe::DataCallbackResult::Continue;
             }
@@ -121,7 +123,6 @@ public:
             out[i] = -antiNoise;
         }
 
-        // FFT on output for visualiser
         std::vector<std::complex<float>> fftData(kFftSize, {0.0f, 0.0f});
         for (int i = 0; i < kFftSize && i < numFrames; ++i)
             fftData[i] = {inBuf[i], 0.0f};
@@ -162,13 +163,36 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_whitelabs_anc_AncService_startEngine(JNIEnv*, jobject) {
     oboe::Result r;
 
-    // Output stream first — drives the callback thread
+    // Start input first and let it buffer before output begins
+    r = oboe::AudioStreamBuilder()
+        .setDirection(oboe::Direction::Input)
+        ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
+        ->setSharingMode(oboe::SharingMode::Shared)
+        ->setFormat(oboe::AudioFormat::Float)
+        ->setChannelCount(oboe::ChannelCount::Mono)
+        ->setSampleRate(kSampleRate)
+        ->setBufferCapacityInFrames(kFramesPerCb * 4)
+        ->openStream(inputStream);
+
+    if (r != oboe::Result::OK) {
+        LOGE("Input openStream failed: %s", oboe::convertToText(r));
+        writeLog("Input openStream failed");
+        return;
+    }
+
+    inputStream->requestStart();
+
+    // Brief warm-up: let input buffer accumulate ~10ms of mic data
+    // before the output callback begins pulling from it
+    usleep(10000);
+
     r = oboe::AudioStreamBuilder()
         .setDirection(oboe::Direction::Output)
         ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
         ->setSharingMode(oboe::SharingMode::Exclusive)
         ->setFormat(oboe::AudioFormat::Float)
         ->setChannelCount(oboe::ChannelCount::Mono)
+        ->setSampleRate(kSampleRate)
         ->setFramesPerDataCallback(kFramesPerCb)
         ->setDataCallback(&duplexCb)
         ->openStream(outputStream);
@@ -176,39 +200,18 @@ Java_com_whitelabs_anc_AncService_startEngine(JNIEnv*, jobject) {
     if (r != oboe::Result::OK) {
         LOGE("Output openStream failed: %s", oboe::convertToText(r));
         writeLog("Output openStream failed");
+        inputStream->requestStop();
+        inputStream->close();
+        inputStream.reset();
         return;
     }
 
-    int sampleRate = outputStream->getSampleRate();
-    LOGI("Output SR=%d  framesPerCb=%d", sampleRate, kFramesPerCb);
-
-    // Input stream — matched sample rate, no callback (read() driven by output)
-    r = oboe::AudioStreamBuilder()
-        .setDirection(oboe::Direction::Input)
-        ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
-        ->setSharingMode(oboe::SharingMode::Shared)
-        ->setFormat(oboe::AudioFormat::Float)
-        ->setChannelCount(oboe::ChannelCount::Mono)
-        ->setSampleRate(sampleRate)
-        ->setBufferCapacityInFrames(kFramesPerCb * 2)
-        ->openStream(inputStream);
-
-    if (r != oboe::Result::OK) {
-        LOGE("Input openStream failed: %s", oboe::convertToText(r));
-        writeLog("Input openStream failed");
-        outputStream->close();
-        outputStream.reset();
-        return;
-    }
-
-    // Wire input stream pointer into the callback before starting
     duplexCb.inputStream = inputStream.get();
-
-    inputStream->requestStart();
     outputStream->requestStart();
 
-    writeLog("Engine started — duplex single-callback OK");
-    LOGI("ANC engine running");
+    writeLog("Engine started — duplex OK");
+    LOGI("ANC engine running. SR=%d  framesPerCb=%d  readTimeout=%lldns",
+         kSampleRate, kFramesPerCb, (long long)kReadTimeoutNs);
 }
 
 extern "C" JNIEXPORT void JNICALL
