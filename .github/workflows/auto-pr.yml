@@ -1,0 +1,35 @@
+name: Auto PR to main
+
+on:
+  push:
+    branches:
+      - Claude_Dev
+
+jobs:
+  pull-request:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Open or update PR to main
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          base: main
+          branch: Claude_Dev
+          title: "[Claude_Dev] Auto PR — ${{ github.sha }}"
+          body: |
+            Automated pull request from `Claude_Dev` → `main`.
+
+            **Triggered by commit:** `${{ github.sha }}`
+            **Message:** ${{ github.event.head_commit.message }}
+
+            ---
+            *Generated automatically on every push to `Claude_Dev`.*
+          labels: automated
+          draft: false
