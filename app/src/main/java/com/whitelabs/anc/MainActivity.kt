@@ -45,15 +45,20 @@ class MainActivity : AppCompatActivity() {
 
         binding.switchLogging.setOnCheckedChangeListener { _, isChecked ->
             if (isChecked) {
-                val logFile = File(getExternalFilesDir(null), "anc_dev.log")
-                val pfd = android.os.ParcelFileDescriptor.open(
-                    logFile,
-                    android.os.ParcelFileDescriptor.MODE_CREATE or
-                    android.os.ParcelFileDescriptor.MODE_WRITE_ONLY or
-                    android.os.ParcelFileDescriptor.MODE_APPEND
-                )
-                enableLogging(pfd.fd)
-                pfd.detachFd()
+                try {
+                    val dir = getExternalFilesDir(null) ?: filesDir
+                    val logFile = File(dir, "anc_dev.log")
+                    val pfd = android.os.ParcelFileDescriptor.open(
+                        logFile,
+                        android.os.ParcelFileDescriptor.MODE_CREATE or
+                        android.os.ParcelFileDescriptor.MODE_WRITE_ONLY or
+                        android.os.ParcelFileDescriptor.MODE_APPEND
+                    )
+                    val rawFd = pfd.detachFd()
+                    enableLogging(rawFd)
+                } catch (e: Exception) {
+                    binding.switchLogging.isChecked = false
+                }
             } else {
                 disableLogging()
             }
