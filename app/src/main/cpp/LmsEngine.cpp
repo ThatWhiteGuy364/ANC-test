@@ -16,6 +16,7 @@
 #define LOG_TAG "WhiteLabsANC"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -25,11 +26,7 @@ static constexpr int   kFftSize      = 256;
 static constexpr int   kLogInterval  = 4800;
 static constexpr int   kFramesPerCb  = 96;
 static constexpr int   kSampleRate   = 48000;
-
-// Half a buffer period in nanoseconds — long enough to wait for mic data
-// without overrunning the output callback deadline
-static constexpr int64_t kReadTimeoutNs =
-    static_cast<int64_t>(kFramesPerCb) * 1000000000LL / kSampleRate / 2;
+static constexpr int64_t kReadTimeoutNs = 1000000LL; // 1ms
 
 // ─── LMS State ────────────────────────────────────────────────────────────────
 
@@ -49,6 +46,9 @@ static std::atomic<bool> loggingEnabled{false};
 static int               logFrameCounter = 0;
 
 static void writeLog(const char* line) {
+    // Always write to logcat regardless of file toggle
+    LOGI("%s", line);
+
     if (!loggingEnabled.load()) return;
     int fd = logFd.load();
     if (fd < 0) return;
@@ -84,29 +84,46 @@ static void computeFFT(std::vector<std::complex<float>>& data) {
 class DuplexCallback : public oboe::AudioStreamDataCallback {
 public:
     oboe::AudioStream* inputStream = nullptr;
+    std::atomic<int>   callbackCount{0};
+    std::atomic<int>   emptyReads{0};
 
     oboe::DataCallbackResult onAudioReady(oboe::AudioStream* /*outputStream*/,
                                           void* audioData,
                                           int32_t numFrames) override {
         auto* out = static_cast<float*>(audioData);
-        float inBuf[kFramesPerCb];
-        std::memset(inBuf, 0, sizeof(float) * numFrames);
+        float inBuf[kFramesPerCb] = {};
+
+        int framesRead = 0;
 
         if (inputStream) {
             auto res = inputStream->read(inBuf, numFrames, kReadTimeoutNs);
-            if (!res || res.value() == 0) {
-                // No mic data yet — output silence, keep going
-                std::memset(out, 0, sizeof(float) * numFrames);
-                return oboe::DataCallbackResult::Continue;
+            if (res) {
+                framesRead = res.value();
+            } else {
+                LOGW("read() error: %s", oboe::convertToText(res.error()));
             }
+        }
+
+        int cc = callbackCount.fetch_add(1) + 1;
+
+        if (framesRead == 0) {
+            emptyReads.fetch_add(1);
+            std::memset(out, 0, sizeof(float) * numFrames);
+            if (cc % 500 == 0) {
+                char buf[128];
+                std::snprintf(buf, sizeof(buf),
+                    "WARN: %d callbacks, %d empty reads",
+                    cc, emptyReads.load());
+                writeLog(buf);
+            }
+            return oboe::DataCallbackResult::Continue;
         }
 
         float sumError = 0.0f;
         float sumPower = 0.0f;
 
-        for (int i = 0; i < numFrames; ++i) {
+        for (int i = 0; i < framesRead; ++i) {
             float noise = inBuf[i];
-
             for (int j = kFilterSize - 1; j > 0; --j) lmsRingBuf[j] = lmsRingBuf[j - 1];
             lmsRingBuf[0] = noise;
 
@@ -122,9 +139,12 @@ public:
 
             out[i] = -antiNoise;
         }
+        // Zero remainder if framesRead < numFrames
+        if (framesRead < numFrames)
+            std::memset(out + framesRead, 0, sizeof(float) * (numFrames - framesRead));
 
         std::vector<std::complex<float>> fftData(kFftSize, {0.0f, 0.0f});
-        for (int i = 0; i < kFftSize && i < numFrames; ++i)
+        for (int i = 0; i < kFftSize && i < framesRead; ++i)
             fftData[i] = {inBuf[i], 0.0f};
         computeFFT(fftData);
         {
@@ -133,18 +153,16 @@ public:
                 latestMagnitudes[i] = std::abs(fftData[i]);
         }
 
-        if (loggingEnabled.load()) {
-            logFrameCounter += numFrames;
-            if (logFrameCounter >= kLogInterval) {
-                logFrameCounter = 0;
-                char buf[128];
-                std::snprintf(buf, sizeof(buf),
-                    "frames=%d  input_rms=%.5f  error_rms=%.5f",
-                    numFrames,
-                    std::sqrt(sumPower / float(numFrames)),
-                    std::sqrt(sumError / float(numFrames)));
-                writeLog(buf);
-            }
+        logFrameCounter += framesRead;
+        if (logFrameCounter >= kLogInterval) {
+            logFrameCounter = 0;
+            char buf[128];
+            std::snprintf(buf, sizeof(buf),
+                "OK cb=%d  read=%d  input_rms=%.5f  error_rms=%.5f",
+                cc, framesRead,
+                std::sqrt(sumPower / float(framesRead)),
+                std::sqrt(sumError / float(framesRead)));
+            writeLog(buf);
         }
 
         return oboe::DataCallbackResult::Continue;
@@ -157,61 +175,95 @@ static DuplexCallback duplexCb;
 static std::shared_ptr<oboe::AudioStream> inputStream;
 static std::shared_ptr<oboe::AudioStream> outputStream;
 
-// ─── JNI ─────────────────────────────────────────────────────────────────────
+// ─── Stream open helper: tries preferred sharing mode, falls back ─────────────
 
-extern "C" JNIEXPORT void JNICALL
-Java_com_whitelabs_anc_AncService_startEngine(JNIEnv*, jobject) {
-    oboe::Result r;
-
-    // Start input first and let it buffer before output begins
-    r = oboe::AudioStreamBuilder()
-        .setDirection(oboe::Direction::Input)
-        ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
-        ->setSharingMode(oboe::SharingMode::Shared)
-        ->setFormat(oboe::AudioFormat::Float)
-        ->setChannelCount(oboe::ChannelCount::Mono)
-        ->setSampleRate(kSampleRate)
-        ->setBufferCapacityInFrames(kFramesPerCb * 4)
-        ->openStream(inputStream);
-
-    if (r != oboe::Result::OK) {
-        LOGE("Input openStream failed: %s", oboe::convertToText(r));
-        writeLog("Input openStream failed");
-        return;
-    }
-
-    inputStream->requestStart();
-
-    // Brief warm-up: let input buffer accumulate ~10ms of mic data
-    // before the output callback begins pulling from it
-    usleep(10000);
-
-    r = oboe::AudioStreamBuilder()
+static oboe::Result openOutputStream(oboe::SharingMode mode) {
+    return oboe::AudioStreamBuilder()
         .setDirection(oboe::Direction::Output)
         ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
-        ->setSharingMode(oboe::SharingMode::Exclusive)
+        ->setSharingMode(mode)
         ->setFormat(oboe::AudioFormat::Float)
         ->setChannelCount(oboe::ChannelCount::Mono)
         ->setSampleRate(kSampleRate)
         ->setFramesPerDataCallback(kFramesPerCb)
         ->setDataCallback(&duplexCb)
         ->openStream(outputStream);
+}
+
+// ─── JNI ─────────────────────────────────────────────────────────────────────
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_whitelabs_anc_AncService_startEngine(JNIEnv*, jobject) {
+
+    // Reset diagnostics
+    duplexCb.callbackCount.store(0);
+    duplexCb.emptyReads.store(0);
+    std::memset(weights, 0, sizeof(weights));
+    std::memset(lmsRingBuf, 0, sizeof(lmsRingBuf));
+
+    writeLog("startEngine called");
+
+    // ── Input stream ──
+    oboe::Result r = oboe::AudioStreamBuilder()
+        .setDirection(oboe::Direction::Input)
+        ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
+        ->setSharingMode(oboe::SharingMode::Shared)
+        ->setFormat(oboe::AudioFormat::Float)
+        ->setChannelCount(oboe::ChannelCount::Mono)
+        ->setSampleRate(kSampleRate)
+        ->setBufferCapacityInFrames(kFramesPerCb * 8)
+        ->openStream(inputStream);
 
     if (r != oboe::Result::OK) {
-        LOGE("Output openStream failed: %s", oboe::convertToText(r));
-        writeLog("Output openStream failed");
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "Input openStream FAILED: %s", oboe::convertToText(r));
+        LOGE("%s", buf);
+        writeLog(buf);
+        return;
+    }
+
+    int actualSR = inputStream->getSampleRate();
+    {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "Input opened OK  SR=%d", actualSR);
+        writeLog(buf);
+    }
+
+    inputStream->requestStart();
+    writeLog("Input stream started — warming up 20ms");
+    usleep(20000);
+
+    // ── Output stream: try Exclusive, fall back to Shared ──
+    r = openOutputStream(oboe::SharingMode::Exclusive);
+    if (r != oboe::Result::OK) {
+        LOGW("Exclusive output failed (%s), retrying Shared", oboe::convertToText(r));
+        r = openOutputStream(oboe::SharingMode::Shared);
+    }
+
+    if (r != oboe::Result::OK) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "Output openStream FAILED: %s", oboe::convertToText(r));
+        LOGE("%s", buf);
+        writeLog(buf);
         inputStream->requestStop();
         inputStream->close();
         inputStream.reset();
         return;
     }
 
+    {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf),
+            "Output opened OK  SR=%d  sharing=%s  framesPerCb=%d",
+            outputStream->getSampleRate(),
+            outputStream->getSharingMode() == oboe::SharingMode::Exclusive ? "Exclusive" : "Shared",
+            kFramesPerCb);
+        writeLog(buf);
+    }
+
     duplexCb.inputStream = inputStream.get();
     outputStream->requestStart();
-
-    writeLog("Engine started — duplex OK");
-    LOGI("ANC engine running. SR=%d  framesPerCb=%d  readTimeout=%lldns",
-         kSampleRate, kFramesPerCb, (long long)kReadTimeoutNs);
+    writeLog("Output stream started — engine running");
 }
 
 extern "C" JNIEXPORT void JNICALL
